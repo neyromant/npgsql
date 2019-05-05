@@ -1,7 +1,6 @@
 ﻿using System;
-using System.Diagnostics;
-using System.Reflection;
-using JetBrains.Annotations;
+using System.Diagnostics.Tracing;
+using System.Threading;
 using Npgsql.Logging;
 
 namespace Npgsql
@@ -61,36 +60,29 @@ namespace Npgsql
                 var enabled = false;
                 var expensiveEnabled = false;
 
-#if NET461
                 try
                 {
                     if (usePerfCounters)
                     {
-                        enabled = PerformanceCounterCategory.Exists(Counter.DiagnosticsCounterCategory);
-                        if (!enabled)
-                            Log.Warn($"{nameof(NpgsqlConnectionStringBuilder.UsePerfCounters)} was specified but the Performance Counter category wasn't found. You probably need to install the Npgsql MSI.");
-                        var perfCtrSwitch = new TraceSwitch("ConnectionPoolPerformanceCounterDetail",
-                            "level of detail to track with connection pool performance counters");
-                        expensiveEnabled = enabled && perfCtrSwitch.Level == TraceLevel.Verbose;
+                        enabled = true;
+                        expensiveEnabled = true;
                     }
                 }
                 catch (Exception e)
                 {
                     Log.Debug("Exception while checking for performance counter category (counters will be disabled)", e);
                 }
-#endif
-
                 try
                 {
-                    HardConnectsPerSecond = new Counter(enabled, nameof(HardConnectsPerSecond));
-                    HardDisconnectsPerSecond = new Counter(enabled, nameof(HardDisconnectsPerSecond));
-                    NumberOfActiveConnectionPools = new Counter(enabled, nameof(NumberOfActiveConnectionPools));
-                    NumberOfNonPooledConnections = new Counter(enabled, nameof(NumberOfNonPooledConnections));
-                    NumberOfPooledConnections = new Counter(enabled, nameof(NumberOfPooledConnections));
-                    SoftConnectsPerSecond = new Counter(expensiveEnabled, nameof(SoftConnectsPerSecond));
-                    SoftDisconnectsPerSecond = new Counter(expensiveEnabled, nameof(SoftDisconnectsPerSecond));
-                    NumberOfActiveConnections = new Counter(expensiveEnabled, nameof(NumberOfActiveConnections));
-                    NumberOfFreeConnections = new Counter(expensiveEnabled, nameof(NumberOfFreeConnections));
+                    HardConnectsPerSecond = new Counter(enabled, nameof(HardConnectsPerSecond), CustomMetricsEventSource.Log);
+                    HardDisconnectsPerSecond = new Counter(enabled, nameof(HardDisconnectsPerSecond), CustomMetricsEventSource.Log);
+                    NumberOfActiveConnectionPools = new Counter(enabled, nameof(NumberOfActiveConnectionPools), CustomMetricsEventSource.Log);
+                    NumberOfNonPooledConnections = new Counter(enabled, nameof(NumberOfNonPooledConnections), CustomMetricsEventSource.Log);
+                    NumberOfPooledConnections = new Counter(enabled, nameof(NumberOfPooledConnections), CustomMetricsEventSource.Log);
+                    SoftConnectsPerSecond = new Counter(expensiveEnabled, nameof(SoftConnectsPerSecond), CustomMetricsEventSource.Log);
+                    SoftDisconnectsPerSecond = new Counter(expensiveEnabled, nameof(SoftDisconnectsPerSecond), CustomMetricsEventSource.Log);
+                    NumberOfActiveConnections = new Counter(expensiveEnabled, nameof(NumberOfActiveConnections), CustomMetricsEventSource.Log);
+                    NumberOfFreeConnections = new Counter(expensiveEnabled, nameof(NumberOfFreeConnections), CustomMetricsEventSource.Log);
                 }
                 catch (Exception e)
                 {
@@ -102,116 +94,49 @@ namespace Npgsql
 #pragma warning restore CA1801 // Review unused parameters
 
     /// <summary>
+    /// EventSource for create events from NpgSql 
+    /// </summary>
+    [EventSource(Name = "NpgSqlMetricsEventSource")]
+    public sealed class CustomMetricsEventSource : EventSource
+    {
+        /// <summary>
+        /// Log instance
+        /// </summary>
+        public static CustomMetricsEventSource Log = new CustomMetricsEventSource();
+
+        /// <inheritdoc />
+        CustomMetricsEventSource()
+        {
+        }
+    }
+
+    /// <summary>
     /// This class is currently a simple wrapper around System.Diagnostics.PerformanceCounter.
     /// Since these aren't supported in .NET Standard, all the ifdef'ing happens here.
     /// When an alternative performance counter API emerges for netstandard, it can be added here.
     /// </summary>
-    sealed class Counter : IDisposable
+    sealed class Counter : EventCounter
     {
-#if NET461
-        internal const string DiagnosticsCounterCategory = ".NET Data Provider for PostgreSQL (Npgsql)";
+        readonly bool _isEnabled;
+        private long _value;
+        public long Value => _value;
 
-        [CanBeNull]
-        internal PerformanceCounter DiagnosticsCounter { get; private set; }
-#endif
-        public string Name { get; }
 
-        internal Counter(bool enabled, string diagnosticsCounterName)
+        internal Counter(bool enabled, string diagnosticsCounterName, EventSource eventSource) : base(diagnosticsCounterName, eventSource)
         {
-            Name = diagnosticsCounterName;
-            if (!enabled)
-                return;
-
-#if NET461
-            DiagnosticsCounter = new PerformanceCounter
-            {
-                CategoryName = DiagnosticsCounterCategory,
-                CounterName = diagnosticsCounterName,
-                InstanceName = InstanceName,
-                InstanceLifetime = PerformanceCounterInstanceLifetime.Process,
-                ReadOnly = false,
-                RawValue = 0
-            };
-
-            AppDomain.CurrentDomain.DomainUnload += OnDomainUnload;
-            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
-            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
-#endif
+            _isEnabled = enabled;
         }
 
         internal void Increment()
         {
-#if NET461
-            DiagnosticsCounter?.Increment();
-#endif
+            if(_isEnabled)
+                WriteMetric(Interlocked.Increment(ref _value));
         }
 
         internal void Decrement()
         {
-#if NET461
-            DiagnosticsCounter?.Decrement();
-#endif
+            if(_isEnabled)
+                WriteMetric(Interlocked.Decrement(ref _value));
         }
-
-        public void Dispose()
-        {
-#if NET461
-            var diagnosticsCounter = DiagnosticsCounter;
-            DiagnosticsCounter = null;
-            diagnosticsCounter?.RemoveInstance();
-#endif
-        }
-
-#if NET461
-        void OnProcessExit(object sender, EventArgs e) => Dispose();
-        void OnDomainUnload(object sender, EventArgs e) => Dispose();
-        void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
-        {
-            if (e.IsTerminating)
-                Dispose();
-        }
-
-        const int CounterInstanceNameMaxLength = 127;
-
-        static readonly string InstanceName = GetInstanceName();
-
-        static string GetInstanceName()
-        {
-            string result = null;
-
-            // Code borrowed from the .NET reference sources
-
-            var instanceName = Assembly.GetEntryAssembly()?.GetName().Name;
-            if (string.IsNullOrEmpty(instanceName))
-                instanceName = AppDomain.CurrentDomain.FriendlyName;
-
-            var pid = Process.GetCurrentProcess().Id;
-
-            result = string.Format((IFormatProvider)null, "{0}[{1}]", instanceName, pid);
-            result = result.Replace('(', '[').Replace(')', ']').Replace('#', '_').Replace('/', '_').Replace('\\', '_');
-
-            if (result.Length > CounterInstanceNameMaxLength)
-            {
-                // Replacing the middle part with "[...]"
-                // For example: if path is c:\long_path\very_(Ax200)_long__path\perftest.exe and process ID is 1234 than the resulted instance name will be:
-                // c:\long_path\very_(AxM)[...](AxN)_long__path\perftest.exe[1234]
-                // while M and N are adjusted to make each part before and after the [...] = 61 (making the total = 61 + 5 + 61 = 127)
-                const string insertString = "[...]";
-                var firstPartLength = (CounterInstanceNameMaxLength - insertString.Length) / 2;
-                var lastPartLength = CounterInstanceNameMaxLength - firstPartLength - insertString.Length;
-                result = string.Format(null, "{0}{1}{2}",
-                    result.Substring(0, firstPartLength),
-                    insertString,
-                    result.Substring(result.Length - lastPartLength, lastPartLength));
-
-                Debug.Assert(result.Length == CounterInstanceNameMaxLength,
-                    string.Format((IFormatProvider)null, "wrong calculation of the instance name: expected {0}, actual: {1}", CounterInstanceNameMaxLength, result.Length));
-            }
-
-            return result;
-        }
-#endif
-
-        public override string ToString() => Name;
     }
 }
